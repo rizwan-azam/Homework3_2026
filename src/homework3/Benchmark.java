@@ -12,6 +12,8 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
@@ -39,6 +41,7 @@ final class Benchmark {
 
     private final Config cfg;
     private final InsertedRows insertedRows;
+    private final WriteReservations writeReservations = new WriteReservations();
     private final AtomicLong issued = new AtomicLong();
     private final LongAdder committed = new LongAdder();
     private final LongAdder pointReads = new LongAdder();
@@ -105,11 +108,9 @@ final class Benchmark {
                     System.err.printf(Locale.ROOT, "[progress] %.1f s, %,d committed, %.2f tx/s%n",
                             elapsed / 1e9, committed.sum(), committed.sum() / (elapsed / 1e9));
                 }
-                if (cfg.durationSeconds() > 0
-                        && System.nanoTime() > deadlineNs + TimeUnit.MINUTES.toNanos(5)) {
-                    pool.shutdownNow();
-                    throw new IllegalStateException("In-flight transaction did not drain within 5 minutes; examine locks");
-                }
+                // Stop admitting new plans at the deadline, but do not discard an
+                // admitted transaction just because its drain takes a long time.
+                // Progress output continues while waiting for database completion.
             }
             // Future completion is already reflected in the terminated executor; capture
             // time promptly (no extra one-second polling/sleep overhead in throughput).
@@ -122,6 +123,69 @@ final class Benchmark {
             pool.shutdownNow();
             // If worker construction failed before submission, close unopened workers too.
             for (Worker w : workers) try { w.close(); } catch (Exception ignored) { }
+        }
+    }
+
+    /**
+     * Atomically reserve all row IDs needed by one writer. Overlapping writers
+     * wait, while disjoint writers and MVCC readers can still run concurrently.
+     * Earlier conflicting waiters cannot be overtaken by later arrivals.
+     *
+     * For this benchmark's schema and one running benchmark process, this removes
+     * writer deadlock cycles without changing UPDATE order. Progress assumes
+     * finite database operations and runnable threads eventually being scheduled.
+     * Outside applications and permanent database errors are not controlled here.
+     * Prepared with OpenAI ChatGPT assistance.
+     */
+    static final class WriteReservations {
+        private final Set<Integer> held = new HashSet<>();
+        private final List<Request> waiting = new ArrayList<>();
+
+        private static final class Request {
+            final int[] keys;
+            Request(int[] keys) { this.keys = keys.clone(); }
+        }
+
+        final class Lease implements AutoCloseable {
+            private final Request request;
+            private boolean released;
+            private Lease(Request request) { this.request = request; }
+            @Override public void close() {
+                synchronized (WriteReservations.this) {
+                    if (!released) {
+                        for (int key : request.keys) held.remove(key);
+                        released = true;
+                        WriteReservations.this.notifyAll();
+                    }
+                }
+            }
+        }
+
+        synchronized Lease acquire(int[] keys) throws InterruptedException {
+            Request request = new Request(keys);
+            Lease lease = new Lease(request);
+            waiting.add(request);
+            try {
+                while (!canStart(request)) wait();
+                waiting.remove(request);
+                for (int key : request.keys) held.add(key);
+                return lease;
+            } catch (InterruptedException e) {
+                waiting.remove(request);
+                notifyAll();
+                throw e;
+            }
+        }
+
+        private boolean canStart(Request request) {
+            for (int key : request.keys) if (held.contains(key)) return false;
+            for (Request earlier : waiting) {
+                if (earlier == request) break;
+                for (int a : earlier.keys) {
+                    for (int b : request.keys) if (a == b) return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -156,56 +220,63 @@ final class Benchmark {
             }
         }
 
-        void loop() throws SQLException {
+        void loop() throws SQLException, InterruptedException {
             while (error.get() == null && System.nanoTime() < deadlineNs) {
                 long id = issued.getAndIncrement();
                 if (cfg.transactions() > 0 && id >= cfg.transactions()) break;
                 Workload.Tx tx = Workload.make(id, cfg.seed(), cfg.rows(), insertedRows);
                 long began = System.nanoTime();
-                int attempt = 0;
-                while (true) { // A started transaction MUST eventually commit or fail visibly.
-                    try {
-                        double result = runStatements(tx);
-                        c.commit();
-                        // Publish the INSERT only after commit; other workers can then sample it.
-                        if (tx.kind() == Workload.Kind.INSERT) {
-                            insertedRows.publishedCommit(tx.insertionId());
-                        }
-                        long latency = System.nanoTime() - began;
-                        totalLatencyNs.add(latency);
-                        maxLatencyNs.accumulateAndGet(latency, Math::max);
-                        switch (tx.kind()) {
-                            case POINT_READ -> pointReads.increment();
-                            case INSERT -> inserts.increment();
-                            case FULL_SCAN -> scans.increment();
-                            case WRITE -> writes.increment();
-                        }
-                        committed.increment();
-                        if (cfg.printReads() && (tx.kind() == Workload.Kind.POINT_READ
-                                || tx.kind() == Workload.Kind.FULL_SCAN)) {
-                            System.out.printf(Locale.ROOT, "COMMIT tx=%d worker=%d type=%s sum=%.6f%n",
-                                    tx.id(), workerId, tx.kind(), result);
-                        }
-                        break;
-                    } catch (SQLException ex) {
-                        try { c.rollback(); } catch (SQLException rollbackError) {
-                            ex.addSuppressed(rollbackError);
-                            throw ex;
-                        }
-                        String sqlState = RetryPolicy.retryableState(ex);
-                        if (sqlState == null) throw ex;
-                        retries.increment();
-                        if ("40P01".equals(sqlState)) deadlocks.increment();
-                        if ("40001".equals(sqlState)) serialization.increment();
-                        if ("55P03".equals(sqlState)) locks.increment();
-                        attempt++;
-                        // Exponential randomized backoff prevents synchronized retry/live-lock.
-                        RetryPolicy.backoff(attempt);
-                        if (Thread.currentThread().isInterrupted()) {
-                            throw new IllegalStateException("Worker interrupted while retrying", ex);
+                // All modes use the same scheduler, including the serial baseline.
+                // Reserve the complete write set BEFORE the first SQL update.
+                // Acquisition, key checking and waiting are inside measured runtime.
+                try (WriteReservations.Lease lease = tx.kind() == Workload.Kind.WRITE
+                        ? writeReservations.acquire(tx.dataIds()) : null) {
+                    int attempt = 0;
+                    while (true) { // A started transaction MUST eventually commit or fail visibly.
+                        try {
+                            double result = runStatements(tx);
+                            c.commit();
+                            // Publish the INSERT only after commit; other workers can then sample it.
+                            if (tx.kind() == Workload.Kind.INSERT) {
+                                insertedRows.publishedCommit(tx.insertionId());
+                            }
+                            long latency = System.nanoTime() - began;
+                            totalLatencyNs.add(latency);
+                            maxLatencyNs.accumulateAndGet(latency, Math::max);
+                            switch (tx.kind()) {
+                                case POINT_READ -> pointReads.increment();
+                                case INSERT -> inserts.increment();
+                                case FULL_SCAN -> scans.increment();
+                                case WRITE -> writes.increment();
+                            }
+                            committed.increment();
+                            if (cfg.printReads() && (tx.kind() == Workload.Kind.POINT_READ
+                                    || tx.kind() == Workload.Kind.FULL_SCAN)) {
+                                System.out.printf(Locale.ROOT, "COMMIT tx=%d worker=%d type=%s sum=%.6f%n",
+                                        tx.id(), workerId, tx.kind(), result);
+                            }
+                            break;
+                        } catch (SQLException ex) {
+                            try { c.rollback(); } catch (SQLException rollbackError) {
+                                ex.addSuppressed(rollbackError);
+                                throw ex;
+                            }
+                            String sqlState = RetryPolicy.retryableState(ex);
+                            if (sqlState == null) throw ex;
+                            retries.increment();
+                            if ("40P01".equals(sqlState)) deadlocks.increment();
+                            if ("40001".equals(sqlState)) serialization.increment();
+                            if ("55P03".equals(sqlState)) locks.increment();
+                            attempt++;
+                            // Backoff reduces repeated external conflicts; it is not a fairness guarantee.
+                            RetryPolicy.backoff(attempt);
+                            if (Thread.currentThread().isInterrupted()) {
+                                throw new IllegalStateException("Worker interrupted while retrying", ex);
+                            }
                         }
                     }
-                }
+                } // Release only after this transaction has committed or rolled back.
+
             }
         }
 
@@ -310,6 +381,7 @@ final class Benchmark {
     }
 
     private void printAndStore(double elapsed) throws IOException {
+        System.err.println("writerScheduling=atomic row reservations with conflict FIFO fairness");
         long count = committed.sum();
         double tps = count / elapsed;
         double avgLatencyMs = count > 0 ? totalLatencyNs.sum() / (double) count / 1e6 : 0.0;

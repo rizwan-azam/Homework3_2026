@@ -1,2 +1,0 @@
-timestamp,mode,threads,rows,requested_seconds,max_transactions,seed,actual_seconds,committed,throughput_per_second,point_reads,inserts,full_scans,writes,retry_attempts,deadlocks,serialization_failures,lock_not_available,avg_latency_ms,max_latency_ms
-2026-11-18T22:34:07.901179900Z,cached,4,50000,5,0,20261124,5.004,12994,2596.789,7856,1288,1309,2541,0,0,0,0,0.879,23.930

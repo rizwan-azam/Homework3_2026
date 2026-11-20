@@ -1,1 +1,0 @@
-This directory has a report template, but **no invented performance measurements**. After running `scripts/run_matrix.ps1` or `scripts/run_matrix.sh` against a real PostgreSQL server, `benchmarks.csv` and the individual read-sum logs will be generated here. Complete the report and presentation using those results.
